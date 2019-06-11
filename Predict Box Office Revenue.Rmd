@@ -1,0 +1,457 @@
+---
+title: "TMDB Box Office Prediction"
+output:
+  word_document: default
+  html_document: default
+---
+
+# As of 2018, global box office is worth $41.7 billion dollars. But what makes a movie a top hit? What are the key drivers of revenue? This project will use the data from the movie database Kaggle competition to explore the key drivers of successful movies and develop machine learning models to predict their box office revenues
+
+# OUTLINE
+# Exploratory Data Analysis & Data Cleaning
+# Feature Enginnering (create 5 new features)
+# Preprocess
+# Build Models (4 linear regression and 3 decision tree regression models)
+# Model Comparison
+# Conclusion
+
+
+# Set up
+```{r}
+# load libraries
+library(tidyverse)
+library(GGally)
+library(caret)
+library(lubridate) # date
+library(naniar) # provide plots to explore missing data
+library(randomForest)
+library(rpart.plot)
+
+# packages for generating a word map
+library(tm) # test mining
+library(SnowballC) # text stemming
+library(wordcloud)
+library(XML)
+library(RColorBrewer) # for color palettes
+
+# make sure to get identical result each time running the code
+set.seed(1234)
+```
+
+# Read TMDB dataset
+```{r}
+df_train = read_csv("train.csv")
+df_test = read_csv("test.csv")
+
+# combine the train and test dataset
+data = bind_rows(df_train, df_test)
+
+df_full = data
+```
+
+
+# Exploratory Data Analysis
+```{r}
+# take a high_level view of the dataset
+glimpse(df_full)   # there are 7,398 observations and 23 variables; 3,000 observations are for training
+summary(df_full)
+
+# Let's look at how the movie industry has developed over the years
+# convert release_date column to date format
+df_full$release_date = as.Date(df_full$release_date, format = "%m/%d/%y")
+
+# extract year from the date
+df_full$year = as.numeric(format(df_full$release_date, "%Y"))
+
+# extract month
+df_full$month = as.numeric(format(df_full$release_date, "%m"))
+
+# rename the month
+levels(df_full$month)[levels(df_full$month)==1] = "Jan"
+levels(df_full$month)[levels(df_full$month)==2] = "Feb"
+levels(df_full$month)[levels(df_full$month)==3] = "Mar"
+levels(df_full$month)[levels(df_full$month)==4] = "Apr"
+levels(df_full$month)[levels(df_full$month)==5] = "May"
+levels(df_full$month)[levels(df_full$month)==6] = "Jun"
+levels(df_full$month)[levels(df_full$month)==7] = "Jul"
+levels(df_full$month)[levels(df_full$month)==8] = "Aug"
+levels(df_full$month)[levels(df_full$month)==9] = "Sep"
+levels(df_full$month)[levels(df_full$month)==10] = "Oct"
+levels(df_full$month)[levels(df_full$month)==11] = "Nov"
+levels(df_full$month)[levels(df_full$month)==12] = "Dec"
+
+# plot the number of movies over years
+ggplot(df_full, aes(x = year)) +
+         geom_bar(width = 1, fill="steelblue") +
+         xlim(1970, 2018) # I set limit for x axis because some release years are in the future
+
+# plot number of movies by month
+ggplot(df_full, aes(x = month)) +
+         geom_bar(fill="steelblue")   # looks like summer is peak season
+
+# plot the distribution of revenue
+ggplot(df_full[1:3000, ], aes(x = revenue)) +
+      geom_bar(width = 0.1, fill="steelblue") +
+      scale_x_log10() + 
+      geom_vline(aes(xintercept = mean(revenue)), color = "red", linetype = "dashed")
+
+# plot word map for movie titles
+title_corpus = Corpus(VectorSource(df_full$title))
+title_clean = tm_map(title_corpus, PlainTextDocument) # convert to plain text
+title_clean = tm_map(title_clean, tolower) # convert to lowercases
+title_clean = tm_map(title_clean,removeWords,stopwords("english")) # remove stopwprds
+wordcloud(words = title_clean, min.freq = 3, max.words = 100, colors = brewer.pal(8, "Dark2"))
+
+# plot word cloud for movie taglines
+tagline_corpus = Corpus(VectorSource(df_full$tagline))
+tagline_clean = tm_map(tagline_corpus, PlainTextDocument)
+tagline_clean = tm_map(tagline_clean, tolower) 
+tagline_clean = tm_map(tagline_clean,removeWords,stopwords("english")) 
+wordcloud(words = tagline_clean, min.freq = 3, max.words = 100, colors = brewer.pal(8, "Dark2"))
+
+# use ggpairs to explore possible corelations
+ggpairs(select(df_full[1:3000, ], revenue, popularity, budget, runtime)) 
+# budget has a positive high corelation with revenue (0.753)
+
+# get summary of the missing value in the datasets
+colSums(is.na(df_full))
+
+# plot the percetage of missing values
+gg_miss_var(df_full, show_pct = TRUE) +
+           labs(y = "Percetage of Missing Values for TMDB Datasets")
+```
+
+# Feature Engineering
+# I noticed that some columns like belongs_to_collection and production companies are quite messy as the core information is mixed with irrelevant symbols and ids
+# So I will try to clean them first (I extract keywords by regular expression)
+
+1. belongs_to_collection
+```{r}
+# Extract the name of collections
+df_full$belongs_to_collection = str_extract(df_full$belongs_to_collection, 
+                               pattern = "(?<=name\\'\\:\\s{1}\\').+(?=\\'\\,\\s{1}\\'poster)")
+
+df_full$belongs_to_collection = as.factor(df_full$belongs_to_collection)
+
+# check the top collections by average revenue
+df_full[1:3000, ] %>%
+  group_by(belongs_to_collection) %>%
+  summarise(avg_rev = mean(revenue)) %>%
+  arrange(desc(avg_rev)) %>%
+  filter(!is.na(belongs_to_collection))
+
+# Hypothesis: revenue for movies in a collection are higher than those not in a collection
+# create a collection column to classify whether movies are in a collection or not
+# Feature Engineering - Movie collections
+df_full$collection = 0 
+
+for(i in 1:length(df_full$belongs_to_collection)) {
+  if(is.na(df_full$belongs_to_collection[i])) {
+   df_full$collection[i] = "no"
+  }
+  else {
+    df_full$collection[i] = "yes"
+  }
+}
+
+# plot the revenue for movies in or not in an collection
+ggplot(data = df_full[1:3000, ], aes(x = collection, y = revenue, fill = collection)) +
+              geom_boxplot(alpha = 0.3)
+
+```
+
+2. production countries
+```{r}
+# 2. production countries 
+df_full$production_countries = str_extract(df_full$production_countries, pattern = "[:upper:]+")
+
+# check the top production countries by average revenue
+df_full[1:3000, ] %>%
+  group_by(production_countries) %>%
+  summarise(movies_count = n()) %>%
+  arrange(desc(movies_count)) %>%
+  filter(!is.na(production_countries)) %>%
+  head(10)
+
+# Hypothesis: top production countries have higher box office revenue
+# Feature Engineering - top production countries
+
+df_full$top_production_countries = 0 
+
+for(i in 1:length(df_full$production_countries)) {
+  if(df_full$production_countries[i] %in% c("US", "GB", "FR") ) {
+   df_full$top_production_countries[i] = "yes"
+  }
+  else  {
+    df_full$top_production_countries[i] = "no"
+  }
+}
+# plot
+ggplot(df_full[1:3000, ], aes(x = top_production_countries, y = revenue, fill = top_production_countries)) +
+             geom_boxplot(alpha = 0.3)
+
+```
+
+3. production companies
+```{r}
+# 3. production companies
+df_full$production_companies = gsub('(^\\[\\{\'name\'\\:\\s\'|\'\\,\\s\'id.*)', '',
+                                 df_full$production_companies)
+
+# check the top production companies by average revenue
+df_full[1:3000, ] %>%
+  group_by(production_companies) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  filter(!is.na(production_companies))
+
+# Hypothesis: large production companies make more money
+# Feature Engineering - top production companies
+
+df_full$top_production_companies = 0 
+
+for(i in 1:length(df_full$production_companies)) {
+  if(df_full$production_companies[i] %in% c("Universal Pictures", 
+                                            "Paramount Pictures",
+                                            "Twentieth Century Fox Film Corporation",
+                                            "Columbia Pictures",
+                                            "Warner Bros.",
+                                            "New Line Cinema",
+                                            "Walt Disney Pictures") ) {
+   df_full$top_production_companies[i] = "yes"
+  }
+  else  {
+    df_full$top_production_companies[i] = "no"
+  }
+}
+# plot
+ggplot(data = df_full[1:3000, ], aes(x =top_production_companies, y = revenue, fill = top_production_companies )) +
+             geom_boxplot(alpha = 0.3)
+
+```
+
+4. Languages
+```{r}
+# count the top movie languages
+df_full[1:3000,] %>%
+   group_by(original_language) %>%
+   summarise(count = n()) %>%
+   arrange(desc(count))
+
+# most movies have enghlish as their original languages
+# Hypothesis: english speaking movies will generate more revenue
+# feature engineering: eng_movie
+df_full$eng_movie = 0 
+
+for(i in 1:length(df_full$original_language)) {
+  if(df_full$original_language[i] == "en") {
+   df_full$eng_movie[i] = "yes"
+  }
+  else {
+    df_full$eng_movie[i] = "no"
+  }
+}
+
+# plot the revenue for english movies and all other movies
+ggplot(df_full[1:3000, ], aes(x = eng_movie, y = revenue, fill = eng_movie)) +
+             geom_boxplot(alpha = 0.3) +
+             xlab("Homepage presence")
+```
+
+5. Feature Engineering - Homepage
+```{r}
+# Hypothesis: box office revenue will be higher if they build a homepage
+
+df_full$Hpage_check = 0 
+
+for(i in 1:length(df_full$homepage)) {
+  if(is.na(df_full$homepage[i])) {
+   df_full$Hpage_check[i] = "no"
+  }
+  else {
+    df_full$Hpage_check[i] = "yes"
+  }
+}
+
+# plot the revenue for movies in or not in an collection
+ggplot(data = df_full[1:3000, ], aes(x = Hpage_check, y = revenue, fill = Hpage_check)) +
+              geom_boxplot(alpha = 0.3) + 
+              xlab("Homepage presence")
+        
+```
+
+# Split the datasets into training and testing
+```{r}
+# select variables for modeling
+df_full_final = select(df_full, revenue, budget, popularity, runtime, year, collection, top_production_companies,
+                        top_production_countries, eng_movie, Hpage_check)
+
+# check the missing value of the data
+colSums(is.na(df_full_final)) 
+
+# replace missing values by their mean, except for revenue which is our outcome variable
+df_full_final$runtime[is.na(df_full_final$runtime)] = mean(df_full_final$runtime, na.rm = TRUE)
+df_full_final$year[is.na(df_full_final$year)] = mean(df_full_final$year, na.rm = TRUE)
+
+# check near zero values
+nearZeroVar(df_full_final, saveMetrics = TRUE) # no near zero values
+
+# convert categorical variables to binary features for linear regression
+df_full_linear = df_full_final
+
+df_full_linear = df_full_linear %>% mutate_if(is.character, as.factor)
+
+collection = model.matrix(~collection - 1, data = df_full_linear)
+top_production_companies = model.matrix(~top_production_companies - 1, data = df_full_linear)
+eng_movie = model.matrix(~eng_movie - 1, data = df_full_linear)
+nrow(top_production_companies)
+Hpage_check = model.matrix(~Hpage_check - 1, data = df_full_linear)
+
+df_full_linear = cbind(df_full_linear, collection, top_production_companies, eng_movie, Hpage_check)
+df_full_linear = select(df_full_linear, -collection, -top_production_companies, -eng_movie, -Hpage_check)
+
+```
+
+# Build Models
+
+1. Linear Regresssion
+b. forward regression
+```{r}
+# split the data
+df_train1 = df_full_linear[1:3000, ]
+df_test1 = df_full_linear[3001:7398, ]
+
+forward_model = train(revenue ~ ., data = df_train1,
+                      method = "leapForward", tuneGrid = expand.grid(nvmax = 1:10), 
+                      trControl = trainControl(method = "cv", number = 10))
+
+forward_model
+plot(forward_model)
+# extract the final model
+plot(forward_model$finalModel, scale = "adjr2")
+```
+
+c. ridge regression
+Address the problem of parameter istability caused by highly correlated features
+shrink the unstable coefficients by imposing an additional penalty parameter on the errors of an ordinary least squares regression
+penalize coefficients that are either too big or too small
+```{r}
+ridge_model = train(revenue ~., data = df_train1,
+                    method = "ridge", tuneGrid = expand.grid(lambda = seq(0, 1, 0.05)),
+                    trControl = trainControl(method = "cv", number = 10))
+
+ridge_model
+plot(ridge_model)
+
+# extract the final model
+plot(ridge_model$finalModel)
+```
+
+d. lasso model
+```{r}
+lasso_model = train(revenue ~., data = df_train1,
+                    method = "lasso", tuneGrid = expand.grid(fraction = seq(0, 1, 0.5)),
+                    trControl = trainControl(method = "cv", number = 10))
+lasso_model
+
+plot(lasso_model)
+
+# extract the final model
+plot(lasso_model$finalModel)
+
+# get the model coefficients
+lasso_coefs = predict(lasso_model$finalModel, type = "coef")
+```
+d. simple linear regression model
+```{r}
+fit = train(revenue ~ collectionyes + popularity + budget + eng_movieyes, data = df_train1, 
+            method = "lm",trControl = trainControl(method = "cv", number = 10), metric = "RMSE")
+
+fit
+
+# average parameter values after a 10-fold CV
+fit$finalModel
+summary(fit)
+```
+
+```{r}
+# predict revenue on the test data
+prediction = predict(fit, newdata = df_test1)
+solution = data.frame(id = 3001:7398, revenue = prediction)
+
+# write solution to file and submit to Kaggle website
+# write.csv(solution, file = "linear_prediction.csv", row.names = FALSE)
+
+# linear model has the best average RMSE
+# Kaggle evaluated based on RMSD (Root mean square deviation) 7.36271
+
+```
+
+Linear regression model comparison
+```{r}
+compare = resamples(list(forward_selection = forward_model, 
+                         ridge_selection = ridge_model, lasso_selection = lasso_model, 
+                         linear = fit))
+
+# compare RMSE and R-squared
+summary(compare)
+
+# plot the result
+dotplot(compare)
+```
+One tree model
+```{r}
+training_set = select(df_train1, -revenue)
+tree_model = train(y = df_train1$revenue, x = training_set, method = "rpart")
+
+tree_model
+
+rpart.plot(tree_model$finalModel)
+
+plot(varImp(tree_model))
+```
+
+Bagging model
+```{r}
+bagged_model = train(y = df_train1$revenue, x = training_set, method = "treebag")
+bagged_model
+plot(varImp(bagged_model))
+```
+
+Random forest regression model
+```{r}
+rf_model <- randomForest(revenue ~ ., data = df_train1, ntree = 300, replace = TRUE, importance = TRUE)
+
+rf_model
+plot(rf_model)
+```
+
+```{r}
+# predict revenue on the test data
+prediction1 = predict(rf_model, newdata = df_test1)
+solution1 = data.frame(id = 3001:7398, revenue = prediction1)
+
+# write solution to file and submit to Kaggle website
+write.csv(solution1, file = "tree_prediction.csv", row.names = FALSE)
+
+# Kaggle score is 2.68194
+```
+
+
+
+# Conclusion
+```{r}
+#If you are an entrepreneur who are looking for investment opportunities in the movie industry, you should consider movies have:
+# 1.	Big budgets
+# 2.	High popularity of content
+# 3.	is part of a popular collection
+# 4.	Not short films
+# 5.	From big production companies and countries
+# 6.	Have a homepage
+
+# Next Step of the project to predict accuracy:
+# 1. adjust the movie budget and revenue for inflation 
+# 2. cleaning cast and crew columns to see how famous directors and actors influence the revenue
+
+```
+
